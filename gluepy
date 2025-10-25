@@ -1,0 +1,112 @@
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql.functions import col, count, sum, avg, current_date
+from awsglue.dynamicframe import DynamicFrame
+from datetime import datetime
+
+# Get parameters
+args = getResolvedOptions(sys.argv, [
+    'JOB_NAME',
+    'connection_name',
+    'database_name',
+    'output_bucket'
+])
+
+# Initialize
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+print("="*50)
+print(f"Job Name: {args['JOB_NAME']}")
+print(f"Connection Name: {args['connection_name']}")
+print(f"Database Name: {args['database_name']}")
+print(f"Output Bucket: {args['output_bucket']}")
+print("="*50)
+
+try:
+    # Read from RDS
+    print("Reading from RDS...")
+    customers_df = glueContext.create_dynamic_frame.from_options(
+        connection_type="jdbc",
+        connection_options={
+            "useConnectionProperties": "true",
+            "dbtable": f"{args['database_name']}.customers",
+            "connectionName": args['connection_name']
+        }
+    ).toDF()
+    
+    print(f"✓ Loaded {customers_df.count()} customer records")
+    
+    # Perform transformation
+    print("Transforming data...")
+    summary = customers_df.groupBy("status", "country") \
+        .agg(
+            count("*").alias("customer_count"),
+            sum("total_purchases").alias("total_revenue"),
+            avg("total_purchases").alias("avg_revenue")
+        ) \
+        .orderBy("total_revenue", ascending=False)
+    
+    print(f"✓ Created summary with {summary.count()} records")
+    summary.show(10)
+    
+    # Write to S3 as Parquet
+    output_path = f"s3://{args['output_bucket']}/output/customer_summary/"
+    print(f"Writing to S3: {output_path}")
+    
+    summary.write \
+        .mode("overwrite") \
+        .partitionBy("country") \
+        .parquet(output_path)
+    
+    print(f"✓ Successfully wrote to {output_path}")
+    
+    # Also write as CSV for easy viewing
+    csv_path = f"s3://{args['output_bucket']}/output/customer_summary_csv/"
+    print(f"Writing CSV to: {csv_path}")
+    
+    summary.coalesce(1) \
+        .write \
+        .mode("overwrite") \
+        .option("header", "true") \
+        .csv(csv_path)
+    
+    print(f"✓ Successfully wrote CSV to {csv_path}")
+    
+    # Read from S3 (example)
+    # If you have existing data in S3
+    # input_s3_path = f"s3://{args['output_bucket']}/input/data.parquet"
+    # s3_df = spark.read.parquet(input_s3_path)
+    
+    # Write back to RDS (example)
+    # glueContext.write_dynamic_frame.from_options(
+    #     frame=DynamicFrame.fromDF(summary, glueContext, "summary"),
+    #     connection_type="jdbc",
+    #     connection_options={
+    #         "useConnectionProperties": "true",
+    #         "dbtable": f"{args['database_name']}.customer_summary",
+    #         "connectionName": args['connection_name']
+    #     }
+    # )
+    
+    print("="*50)
+    print("✓ Job completed successfully!")
+    print("="*50)
+    
+except Exception as e:
+    print("="*50)
+    print("✗ Job failed!")
+    print(f"Error: {str(e)}")
+    print("="*50)
+    import traceback
+    traceback.print_exc()
+    raise
+
+job.commit()
