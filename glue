@@ -1,0 +1,252 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Glue Stack with S3 access
+
+Parameters:
+  # RDS Information
+  RDSEndpoint:
+    Type: String
+    Description: RDS Endpoint Address
+    
+  RDSPort:
+    Type: String
+    Default: "3306"
+    Description: RDS Port
+    
+  DatabaseName:
+    Type: String
+    Description: Database name
+    
+  # Secret Information
+  SecretName:
+    Type: String
+    Description: Name of the secret in Secrets Manager
+  
+  # Network Information
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where RDS is located
+    
+  PrivateSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private Subnet ID for Glue connection
+    
+  RDSSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security Group ID of the RDS instance
+  
+  # S3 Buckets
+  GlueScriptBucket:
+    Type: String
+    Description: S3 bucket containing Glue scripts
+    
+  GlueScriptKey:
+    Type: String
+    Default: "scripts/glue_job.py"
+    Description: S3 key for the Glue script
+  
+  OutputBucket:
+    Type: String
+    Description: S3 bucket for output data
+    
+  TempBucket:
+    Type: String
+    Description: S3 bucket for temporary Glue data (optional, can be same as OutputBucket)
+    Default: ""
+
+Resources:
+  # Glue Security Group
+  GlueSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${AWS::StackName}-glue-sg"
+      GroupDescription: Security group for Glue jobs
+      VpcId: !Ref VPCId
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-glue-sg"
+
+  # Self-referencing rule for Glue
+  GlueSelfReferenceRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref GlueSecurityGroup
+      IpProtocol: tcp
+      FromPort: 0
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref GlueSecurityGroup
+
+  # Egress to RDS
+  GlueToRDSEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref GlueSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref RDSPort
+      ToPort: !Ref RDSPort
+      DestinationSecurityGroupId: !Ref RDSSecurityGroupId
+
+  # Egress for S3/Secrets Manager (HTTPS)
+  GlueToInternetEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref GlueSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+
+  # Update RDS Security Group to allow Glue access
+  RDSIngressFromGlue:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RDSSecurityGroupId
+      IpProtocol: tcp
+      FromPort: !Ref RDSPort
+      ToPort: !Ref RDSPort
+      SourceSecurityGroupId: !Ref GlueSecurityGroup
+      Description: Allow access from Glue
+
+  # Glue Connection
+  GlueConnection:
+    Type: AWS::Glue::Connection
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      ConnectionInput:
+        Name: !Sub "${AWS::StackName}-rds-connection"
+        Description: Connection to RDS using existing secret
+        ConnectionType: JDBC
+        ConnectionProperties:
+          JDBC_CONNECTION_URL: !Sub "jdbc:mysql://${RDSEndpoint}:${RDSPort}/${DatabaseName}"
+          SECRET_ID: !Ref SecretName
+          JDBC_ENFORCE_SSL: "false"
+        PhysicalConnectionRequirements:
+          AvailabilityZone: !Select [0, !GetAZs '']
+          SecurityGroupIdList:
+            - !Ref GlueSecurityGroup
+          SubnetId: !Ref PrivateSubnetId
+
+  # Glue IAM Role with S3 Access
+  GlueRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-glue-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}*"
+        
+        - PolicyName: S3FullAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Script bucket access (read-only)
+              - Sid: GlueScriptBucketAccess
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${GlueScriptBucket}"
+                  - !Sub "arn:aws:s3:::${GlueScriptBucket}/*"
+              
+              # Output bucket access (read/write)
+              - Sid: OutputBucketAccess
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:ListBucketMultipartUploads
+                  - s3:AbortMultipartUpload
+                Resource:
+                  - !Sub "arn:aws:s3:::${OutputBucket}"
+                  - !Sub "arn:aws:s3:::${OutputBucket}/*"
+              
+              # Glue temporary buckets
+              - Sid: GlueTempBucketAccess
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - "arn:aws:s3:::aws-glue-*/*"
+                  - "arn:aws:s3:::*/*aws-glue-*/*"
+        
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:AssociateKmsKey
+                Resource: 
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*"
+
+  # Glue Job
+  GlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${AWS::StackName}-etl-job"
+      Description: ETL job to process RDS data
+      Role: !GetAtt GlueRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${GlueScriptBucket}/${GlueScriptKey}"
+        PythonVersion: "3"
+      DefaultArguments:
+        "--job-bookmark-option": "job-bookmark-enable"
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--connection_name": !Ref GlueConnection
+        "--database_name": !Ref DatabaseName
+        "--output_bucket": !Ref OutputBucket
+        "--TempDir": !Sub "s3://${OutputBucket}/temp/"
+        "--enable-glue-datacatalog": "true"
+      Connections:
+        Connections:
+          - !Ref GlueConnection
+      GlueVersion: "4.0"
+      MaxRetries: 1
+      Timeout: 2880
+      NumberOfWorkers: 2
+      WorkerType: G.1X
+
+Outputs:
+  GlueConnectionName:
+    Description: Name of the Glue Connection
+    Value: !Ref GlueConnection
+    Export:
+      Name: !Sub "${AWS::StackName}-ConnectionName"
+  
+  GlueJobName:
+    Description: Name of the Glue Job
+    Value: !Ref GlueJob
+    Export:
+      Name: !Sub "${AWS::StackName}-JobName"
+  
+  GlueRoleArn:
+    Description: ARN of the Glue IAM Role
+    Value: !GetAtt GlueRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-RoleArn"
