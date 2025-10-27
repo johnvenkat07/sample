@@ -4,109 +4,181 @@ from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
-from pyspark.sql.functions import col, count, sum, avg, current_date
+from pyspark.sql.functions import col, current_timestamp
 from awsglue.dynamicframe import DynamicFrame
-from datetime import datetime
 
 # Get parameters
-args = getResolvedOptions(sys.argv, [
-    'JOB_NAME',
-    'connection_name',
-    'database_name',
-    'output_bucket'
-])
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'connection_name'])
 
-# Initialize
+# Initialize Glue
 sc = SparkContext()
 glueContext = GlueContext(sc)
 spark = glueContext.spark_session
 job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
 
-print("="*50)
-print(f"Job Name: {args['JOB_NAME']}")
-print(f"Connection Name: {args['connection_name']}")
-print(f"Database Name: {args['database_name']}")
-print(f"Output Bucket: {args['output_bucket']}")
-print("="*50)
+print("=" * 50)
+print("Employee CRUD Operations")
+print("=" * 50)
 
-try:
-    # Read from RDS
-    print("Reading from RDS...")
-    customers_df = glueContext.create_dynamic_frame.from_options(
+# ==================== CREATE ====================
+def create_employee():
+    """Insert a new employee"""
+    
+    # Employee data
+    employee = {
+        "employee_id": 1001,
+        "first_name": "John",
+        "last_name": "Doe",
+        "email": "john.doe@company.com",
+        "department": "Engineering",
+        "salary": 75000.00,
+        "hire_date": "2024-01-15"
+    }
+    
+    # Create DataFrame
+    df = spark.createDataFrame([employee])
+    df = df.withColumn("created_at", current_timestamp())
+    
+    # Convert to DynamicFrame
+    dynamic_frame = DynamicFrame.fromDF(df, glueContext, "new_employee")
+    
+    # Write to database
+    glueContext.write_dynamic_frame.from_options(
+        frame=dynamic_frame,
         connection_type="jdbc",
         connection_options={
             "useConnectionProperties": "true",
-            "dbtable": f"{args['database_name']}.customers",
+            "dbtable": "public.employees",
             "connectionName": args['connection_name']
         }
-    ).toDF()
+    )
     
-    print(f"✓ Loaded {customers_df.count()} customer records")
+    print(f"✓ Created employee: {employee['first_name']} {employee['last_name']}")
+
+
+# ==================== READ ====================
+def read_employee(employee_id):
+    """Read a single employee by ID"""
     
-    # Perform transformation
-    print("Transforming data...")
-    summary = customers_df.groupBy("status", "country") \
-        .agg(
-            count("*").alias("customer_count"),
-            sum("total_purchases").alias("total_revenue"),
-            avg("total_purchases").alias("avg_revenue")
-        ) \
-        .orderBy("total_revenue", ascending=False)
+    query = f"SELECT * FROM public.employees WHERE employee_id = {employee_id}"
     
-    print(f"✓ Created summary with {summary.count()} records")
-    summary.show(10)
+    # Read from database
+    dynamic_frame = glueContext.create_dynamic_frame.from_options(
+        connection_type="jdbc",
+        connection_options={
+            "useConnectionProperties": "true",
+            "query": query,
+            "connectionName": args['connection_name']
+        }
+    )
     
-    # Write to S3 as Parquet
-    output_path = f"s3://{args['output_bucket']}/output/customer_summary/"
-    print(f"Writing to S3: {output_path}")
+    df = dynamic_frame.toDF()
     
-    summary.write \
-        .mode("overwrite") \
-        .partitionBy("country") \
-        .parquet(output_path)
+    if df.count() > 0:
+        print(f"✓ Found employee with ID {employee_id}")
+        df.show()
+    else:
+        print(f"✗ No employee found with ID {employee_id}")
     
-    print(f"✓ Successfully wrote to {output_path}")
+    return df
+
+
+# ==================== UPDATE ====================
+def update_employee(employee_id, new_salary):
+    """Update employee salary"""
     
-    # Also write as CSV for easy viewing
-    csv_path = f"s3://{args['output_bucket']}/output/customer_summary_csv/"
-    print(f"Writing CSV to: {csv_path}")
+    # Read all employees
+    dynamic_frame = glueContext.create_dynamic_frame.from_options(
+        connection_type="jdbc",
+        connection_options={
+            "useConnectionProperties": "true",
+            "dbtable": "public.employees",
+            "connectionName": args['connection_name']
+        }
+    )
     
-    summary.coalesce(1) \
-        .write \
-        .mode("overwrite") \
-        .option("header", "true") \
-        .csv(csv_path)
+    df = dynamic_frame.toDF()
     
-    print(f"✓ Successfully wrote CSV to {csv_path}")
+    # Update salary for the specific employee
+    from pyspark.sql.functions import when
     
-    # Read from S3 (example)
-    # If you have existing data in S3
-    # input_s3_path = f"s3://{args['output_bucket']}/input/data.parquet"
-    # s3_df = spark.read.parquet(input_s3_path)
+    updated_df = df.withColumn(
+        "salary",
+        when(col("employee_id") == employee_id, new_salary).otherwise(col("salary"))
+    ).withColumn(
+        "updated_at",
+        when(col("employee_id") == employee_id, current_timestamp()).otherwise(col("updated_at"))
+    )
     
-    # Write back to RDS (example)
-    # glueContext.write_dynamic_frame.from_options(
-    #     frame=DynamicFrame.fromDF(summary, glueContext, "summary"),
-    #     connection_type="jdbc",
-    #     connection_options={
-    #         "useConnectionProperties": "true",
-    #         "dbtable": f"{args['database_name']}.customer_summary",
-    #         "connectionName": args['connection_name']
-    #     }
-    # )
+    # Convert back to DynamicFrame
+    updated_dynamic = DynamicFrame.fromDF(updated_df, glueContext, "updated")
     
-    print("="*50)
-    print("✓ Job completed successfully!")
-    print("="*50)
+    # Write back to database
+    glueContext.write_dynamic_frame.from_options(
+        frame=updated_dynamic,
+        connection_type="jdbc",
+        connection_options={
+            "useConnectionProperties": "true",
+            "dbtable": "public.employees",
+            "connectionName": args['connection_name']
+        }
+    )
     
-except Exception as e:
-    print("="*50)
-    print("✗ Job failed!")
-    print(f"Error: {str(e)}")
-    print("="*50)
-    import traceback
-    traceback.print_exc()
-    raise
+    print(f"✓ Updated employee {employee_id} salary to ${new_salary}")
+
+
+# ==================== DELETE ====================
+def delete_employee(employee_id):
+    """Delete an employee by ID"""
+    
+    # Read all employees
+    dynamic_frame = glueContext.create_dynamic_frame.from_options(
+        connection_type="jdbc",
+        connection_options={
+            "useConnectionProperties": "true",
+            "dbtable": "public.employees",
+            "connectionName": args['connection_name']
+        }
+    )
+    
+    df = dynamic_frame.toDF()
+    
+    # Filter out the employee to delete
+    filtered_df = df.filter(col("employee_id") != employee_id)
+    
+    # Convert to DynamicFrame
+    filtered_dynamic = DynamicFrame.fromDF(filtered_df, glueContext, "filtered")
+    
+    # Write back to database
+    glueContext.write_dynamic_frame.from_options(
+        frame=filtered_dynamic,
+        connection_type="jdbc",
+        connection_options={
+            "useConnectionProperties": "true",
+            "dbtable": "public.employees",
+            "connectionName": args['connection_name']
+        }
+    )
+    
+    print(f"✓ Deleted employee with ID {employee_id}")
+
+
+# ==================== MAIN EXECUTION ====================
+
+# Create a new employee
+create_employee()
+
+# Read the employee
+read_employee(1001)
+
+# Update the employee's salary
+update_employee(1001, 80000.00)
+
+# Read again to verify update
+read_employee(1001)
+
+# Delete the employee
+# delete_employee(1001)
 
 job.commit()
